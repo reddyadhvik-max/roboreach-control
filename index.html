@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>RoboReach Control</title>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --line:#2a313c; --text:#e6e9ee; --dim:#8a94a3; --accent:#4fb3ff; --hot:#ff6b4a; --ok:#4ade80; }
+  * { box-sizing:border-box; -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:15px system-ui, sans-serif; overflow:hidden; }
+  header { height:40px; display:flex; align-items:center; gap:12px; padding:0 16px; border-bottom:1px solid var(--line); }
+  header b { letter-spacing:.04em; }
+  #status { color:var(--dim); font-size:13px; }
+  #status.on { color:var(--ok); }
+  main { height:calc(100% - 40px); display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); grid-template-rows:minmax(0,1fr); gap:16px; padding:16px; }
+  canvas { width:100%; height:100%; display:block; touch-action:none; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
+  #mid { display:flex; flex-direction:column; gap:12px; justify-content:center; width:110px; }
+  button { font:600 15px system-ui, sans-serif; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 8px; touch-action:none; position:relative; overflow:hidden; }
+  button:active, button.held { border-color:var(--accent); }
+  #throw { border-color:var(--hot); color:var(--hot); padding:28px 8px; }
+  #throw i { position:absolute; left:0; bottom:0; height:100%; width:0; background:var(--hot); opacity:.3; }
+  @media (orientation:portrait) { main { grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr) auto minmax(0,1fr); } #mid { flex-direction:row; width:auto; } #mid button { flex:1; } }
+  #login { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; z-index:9; }
+  #login form { display:flex; flex-direction:column; gap:10px; width:min(320px, calc(100% - 32px)); }
+  #login input { font:16px system-ui, sans-serif; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); -webkit-user-select:text; user-select:text; }
+  #login button { background:var(--accent); color:#04121f; border:0; padding:14px; }
+  #msg { color:var(--hot); min-height:1.2em; font-size:14px; }
+</style>
+</head>
+<body>
+<div id="login">
+  <form>
+    <b>RoboReach</b>
+    <input id="user" placeholder="Username" autocomplete="username" required>
+    <input id="pass" type="password" placeholder="Password" autocomplete="current-password" required>
+    <button>Connect over Bluetooth</button>
+    <div id="msg"></div>
+  </form>
+</div>
+<header><b>ROBOREACH</b><span id="status">offline</span></header>
+<main>
+  <canvas id="arm"></canvas>
+  <div id="mid">
+    <button id="open">OPEN</button>
+    <button id="close">CLOSE</button>
+    <button id="throw"><i></i>HOLD TO THROW</button>
+  </div>
+  <canvas id="stick"></canvas>
+</main>
+<script>
+// ---- arm geometry, must match roboreach.ino ----
+const L1 = 10, L2 = 15;                              // rod lengths, cm
+const LIMITS = { base: [0, 180], arm: [0, 270] };    // servo degrees = BASE_MIN/MAX, ARM_MIN/MAX / 10
+const VIEW = { x0: -27, x1: 27, y0: -12, y1: 27 };   // box area in cm, base pivot at (0,0), forward = right
+const SPP = '00001101-0000-1000-8000-00805f9b34fb';  // Bluetooth serial port profile (HC-05)
+
+let servo = [90, 90];          // target servo angles (deg); both start at 90
+let tap = null;                // last finger point, cm
+let drive = [0, 0], claw = 0;
+let port, writer, authed = false, creds, busy = false;
+const $ = id => document.getElementById(id);
+
+// Two-link IK. Returns [baseDeg, armDeg] or null. Out of reach -> stretch toward the finger.
+// Both elbow solutions get clamped to the servo limits; picks the one whose tip lands closest to the finger,
+// then the one closest to the current pose (so the elbow doesn't flip mid-drag).
+function ik(x, y, prev) {
+  let r = Math.hypot(x, y);
+  if (r < 1e-6) return null;
+  const k = Math.min(Math.max(r, Math.abs(L1 - L2) + 0.01), L1 + L2 - 0.01) / r;
+  const px = x * k, py = y * k;
+  r *= k;
+  const c2 = Math.max(-1, Math.min(1, (r * r - L1 * L1 - L2 * L2) / (2 * L1 * L2)));
+  const clamp = (v, [lo, hi]) => Math.max(lo, Math.min(hi, v));
+  let best = null;
+  for (const s of [1, -1]) {
+    const q2 = s * Math.acos(c2);
+    let b = (Math.atan2(py, px) - Math.atan2(L2 * Math.sin(q2), L1 + L2 * Math.cos(q2))) * 180 / Math.PI;
+    if (b < -90) b += 360;
+    if (b > 270) b -= 360;
+    const sol = [clamp(b, LIMITS.base), clamp(180 + q2 * 180 / Math.PI, LIMITS.arm)];
+    const tip = fk(sol)[1];
+    const miss = Math.round(Math.hypot(tip[0] - px, tip[1] - py) * 10);  // 1mm buckets so ties go to the pose test
+    const cost = Math.abs(sol[0] - prev[0]) + Math.abs(sol[1] - prev[1]);
+    if (!best || miss < best[2] || (miss === best[2] && cost < best[3])) best = [...sol, miss, cost];
+  }
+  return best.slice(0, 2);
+}
+
+function fk([b, a]) {
+  const q1 = b * Math.PI / 180, q12 = q1 + (a - 180) * Math.PI / 180;
+  const e = [L1 * Math.cos(q1), L1 * Math.sin(q1)];
+  return [e, [e[0] + L2 * Math.cos(q12), e[1] + L2 * Math.sin(q12)]];
+}
+
+// ---- canvases ----
+function fit(c) {
+  const r = c.getBoundingClientRect(), d = devicePixelRatio || 1;
+  c.width = r.width * d; c.height = r.height * d;
+  c.getContext('2d').setTransform(d, 0, 0, d, 0, 0);
+  return r;
+}
+const armC = $('arm'), stickC = $('stick');
+let armR, stickR;
+function armMap() {  // cm <-> px, uniform scale centred in the canvas
+  const s = Math.min(armR.width / (VIEW.x1 - VIEW.x0), armR.height / (VIEW.y1 - VIEW.y0));
+  const ox = (armR.width - s * (VIEW.x1 - VIEW.x0)) / 2 - s * VIEW.x0;
+  const oy = (armR.height + s * (VIEW.y1 - VIEW.y0)) / 2 + s * VIEW.y0;
+  return { s, ox, oy, px: ([x, y]) => [ox + x * s, oy - y * s] };
+}
+function drawArm() {
+  const g = armC.getContext('2d'), m = armMap();
+  g.clearRect(0, 0, armR.width, armR.height);
+  const o = m.px([0, 0]);
+  g.strokeStyle = '#2a313c'; g.lineWidth = 1;
+  g.beginPath(); g.arc(o[0], o[1], (L1 + L2) * m.s, 0, 2 * Math.PI); g.stroke();   // max reach
+  g.fillStyle = '#232a35'; g.fillRect(m.px([-12, 0])[0], o[1], 24 * m.s, 6 * m.s); // rover deck
+  const [e, t] = fk(servo), E = m.px(e), T = m.px(t);
+  g.lineCap = 'round'; g.strokeStyle = '#4fb3ff'; g.lineWidth = 10;
+  g.beginPath(); g.moveTo(...o); g.lineTo(...E); g.lineTo(...T); g.stroke();
+  g.fillStyle = '#e6e9ee';
+  for (const p of [o, E]) { g.beginPath(); g.arc(p[0], p[1], 6, 0, 2 * Math.PI); g.fill(); }
+  if (tap) { const P = m.px(tap); g.strokeStyle = '#ff6b4a'; g.lineWidth = 2; g.beginPath(); g.arc(P[0], P[1], 12, 0, 2 * Math.PI); g.stroke(); }
+  g.fillStyle = '#8a94a3'; g.font = '12px system-ui';
+  g.fillText(`base ${servo[0].toFixed(0)}°  arm ${servo[1].toFixed(0)}°`, 10, 18);
+}
+let knob = [0, 0];
+function drawStick() {
+  const g = stickC.getContext('2d'), R = stickRadius(), cx = stickR.width / 2, cy = stickR.height / 2;
+  g.clearRect(0, 0, stickR.width, stickR.height);
+  g.strokeStyle = '#2a313c'; g.lineWidth = 2;
+  g.beginPath(); g.arc(cx, cy, R, 0, 2 * Math.PI); g.stroke();
+  g.beginPath(); g.arc(cx, cy, R * 0.06, 0, 2 * Math.PI); g.stroke();
+  g.fillStyle = '#4fb3ff';
+  g.beginPath(); g.arc(cx + knob[0] * R, cy - knob[1] * R, R * 0.28, 0, 2 * Math.PI); g.fill();
+}
+const stickRadius = () => Math.min(stickR.width, stickR.height) / 2 * 0.72;
+function layout() { armR = fit(armC); stickR = fit(stickC); drawArm(); drawStick(); }
+addEventListener('resize', layout);
+
+// One finger per control, so left thumb on the arm box and right thumb on the stick work together
+function track(el, move, up) {
+  let id = null;
+  el.addEventListener('pointerdown', e => { if (id !== null) return; id = e.pointerId; el.setPointerCapture(id); move(e); });
+  el.addEventListener('pointermove', e => { if (e.pointerId === id) move(e); });
+  const end = e => { if (e.pointerId === id) { id = null; up && up(e); } };
+  el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+}
+track(armC, e => {
+  const m = armMap(), r = armC.getBoundingClientRect();
+  tap = [(e.clientX - r.left - m.ox) / m.s, (m.oy - (e.clientY - r.top)) / m.s];
+  const sol = ik(tap[0], tap[1], servo);
+  if (sol) servo = sol;
+  drawArm();
+});
+track(stickC, e => {
+  const r = stickC.getBoundingClientRect(), R = stickRadius();
+  let x = (e.clientX - r.left - r.width / 2) / R, y = -(e.clientY - r.top - r.height / 2) / R;
+  const d = Math.hypot(x, y);
+  if (d > 1) { x /= d; y /= d; }
+  knob = [x, y];
+  // Speed grows with distance from the centre: arcade mix, small deadzone at the nipple
+  const dz = v => Math.abs(v) < 0.06 ? 0 : v;
+  const c = v => Math.round(Math.max(-1, Math.min(1, v)) * 255);
+  drive = [c(dz(y) + dz(x)), c(dz(y) - dz(x))];
+  drawStick();
+}, () => { knob = [0, 0]; drive = [0, 0]; drawStick(); });
+
+for (const [id, v] of [['open', 1], ['close', -1]]) {
+  const b = $(id);
+  b.addEventListener('pointerdown', e => { b.setPointerCapture(e.pointerId); claw = v; b.classList.add('held'); });
+  const off = () => { claw = 0; b.classList.remove('held'); };
+  b.addEventListener('pointerup', off); b.addEventListener('pointercancel', off);
+}
+// Hold for 0.6s so a stray tap can't fling the arm
+const tb = $('throw'), fill = tb.querySelector('i');
+let holdT;
+tb.addEventListener('pointerdown', e => {
+  tb.setPointerCapture(e.pointerId);
+  fill.style.transition = 'width .6s linear'; fill.style.width = '100%';
+  holdT = setTimeout(() => { send('T\n'); tb.lastChild.textContent = 'THROWN!'; }, 600);
+});
+const cancelThrow = () => {
+  clearTimeout(holdT); fill.style.transition = 'none'; fill.style.width = '0';
+  setTimeout(() => tb.lastChild.textContent = 'HOLD TO THROW', 1500);
+};
+tb.addEventListener('pointerup', cancelThrow); tb.addEventListener('pointercancel', cancelThrow);
+
+// ---- Bluetooth serial ----
+async function send(s) {
+  if (!writer || busy) return;  // skip a frame rather than queue stale ones
+  busy = true;
+  try { await writer.write(new TextEncoder().encode(s)); } catch (e) { offline('link lost'); }
+  busy = false;
+}
+const login = () => send(`L ${creds[0]} ${creds[1]}\n`);
+function offline(why) {
+  authed = false; writer = null;
+  $('status').textContent = 'offline'; $('status').className = '';
+  $('msg').textContent = why; $('login').style.display = '';
+}
+async function readLines() {
+  const reader = port.readable.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const l = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (l === 'OK') { authed = true; $('login').style.display = 'none'; $('status').textContent = 'connected'; $('status').className = 'on'; }
+        else if (l === 'NO') { authed = false; $('msg').textContent = 'Wrong username or password'; $('login').style.display = ''; }
+        else if (l === '?' && authed) login();  // rover timed out (e.g. app was in background): log back in
+      }
+    }
+  } catch (e) {}
+  offline('link lost');
+}
+$('login').querySelector('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  creds = [$('user').value.trim(), $('pass').value];
+  if (/\s/.test(creds[0] + creds[1])) return $('msg').textContent = 'No spaces allowed';
+  if (!('serial' in navigator)) return $('msg').textContent = 'This browser has no Web Serial. Use Chrome.';
+  try {
+    if (!writer) {
+      port = await navigator.serial.requestPort({ allowedBluetoothServiceClassIds: [SPP], filters: [{ bluetoothServiceClassId: SPP }] });
+      await port.open({ baudRate: 9600 });
+      writer = port.writable.getWriter();
+      readLines();
+    }
+    $('msg').textContent = 'Logging in...';
+    document.documentElement.requestFullscreen?.().catch(() => {});
+    login();
+  } catch (err) { $('msg').textContent = err.message; }
+});
+
+// 20 frames/s (~540 B/s, fits the HC-05's 9600 baud). Doubles as the heartbeat: if frames stop, the rover stops driving.
+setInterval(() => {
+  if (authed) send(`F ${drive[0]} ${drive[1]} ${Math.round(servo[0] * 10)} ${Math.round(servo[1] * 10)} ${claw}\n`);
+}, 50);
+layout();
+</script>
+</body>
+</html>
