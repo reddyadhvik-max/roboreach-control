@@ -12,14 +12,19 @@
   header b { letter-spacing:.04em; }
   #status { color:var(--dim); font-size:13px; }
   #status.on { color:var(--ok); }
-  main { height:calc(100% - 40px); display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); grid-template-rows:minmax(0,1fr); gap:16px; padding:16px; }
+  main { height:calc(100% - 40px); display:grid; grid-template-columns:minmax(0,1fr) 200px; grid-template-rows:minmax(0,1fr); gap:16px; padding:16px; }
   canvas { width:100%; height:100%; display:block; touch-action:none; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
-  #mid { display:flex; flex-direction:column; gap:12px; justify-content:center; width:110px; }
+  #mid { display:flex; flex-direction:column; gap:12px; justify-content:center; }
+  .keys { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
+  kbd { font:600 15px system-ui, sans-serif; text-align:center; padding:12px 0; border:1px solid var(--line); border-radius:10px; background:var(--panel); color:var(--dim); }
+  kbd.on { border-color:var(--accent); color:var(--text); }
+  #speed { height:10px; border:1px solid var(--line); border-radius:6px; overflow:hidden; } #speed i { display:block; height:100%; background:var(--accent); }
+  .dim { color:var(--dim); font-size:13px; }
   button { font:600 15px system-ui, sans-serif; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 8px; touch-action:none; position:relative; overflow:hidden; }
   button:active, button.held { border-color:var(--accent); }
   #throw { border-color:var(--hot); color:var(--hot); padding:28px 8px; }
   #throw i { position:absolute; left:0; bottom:0; height:100%; width:0; background:var(--hot); opacity:.3; }
-  @media (orientation:portrait) { main { grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr) auto minmax(0,1fr); } #mid { flex-direction:row; width:auto; } #mid button { flex:1; } }
+  @media (orientation:portrait) { main { grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr) auto; } }
   #login { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; z-index:9; }
   #login form { display:flex; flex-direction:column; gap:10px; width:min(320px, calc(100% - 32px)); }
   #login input { font:16px system-ui, sans-serif; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--text); -webkit-user-select:text; user-select:text; }
@@ -41,11 +46,12 @@
 <main>
   <canvas id="arm"></canvas>
   <div id="mid">
-    <button id="open">OPEN</button>
-    <button id="close">CLOSE</button>
+    <div class="keys"><kbd id="kQ">Q</kbd><kbd id="kW">W</kbd><kbd id="kE">E</kbd><kbd id="kA">A</kbd><kbd id="kS">S</kbd><kbd id="kD">D</kbd></div>
+    <div class="dim">Speed <b id="spd"></b> (scroll wheel)</div>
+    <div id="speed"><i></i></div>
+    <div class="dim">W/S drive, A/D spin, W+A / W+D / S+A / S+D swing. Q opens claw, E closes. Left-click drag in the arm box: rod 1 moves the base servo, rod 2 moves the arm servo, the tip (or anywhere else) moves the whole arm with IK.</div>
     <button id="throw"><i></i>HOLD TO THROW</button>
   </div>
-  <canvas id="stick"></canvas>
 </main>
 <script>
 // ---- arm geometry, must match roboreach.ino ----
@@ -99,8 +105,8 @@ function fit(c) {
   c.getContext('2d').setTransform(d, 0, 0, d, 0, 0);
   return r;
 }
-const armC = $('arm'), stickC = $('stick');
-let armR, stickR;
+const armC = $('arm');
+let armR;
 function armMap() {  // cm <-> px, uniform scale centred in the canvas
   const s = Math.min(armR.width / (VIEW.x1 - VIEW.x0), armR.height / (VIEW.y1 - VIEW.y0));
   const ox = (armR.width - s * (VIEW.x1 - VIEW.x0)) / 2 - s * VIEW.x0;
@@ -123,54 +129,64 @@ function drawArm() {
   g.fillStyle = '#8a94a3'; g.font = '12px system-ui';
   g.fillText(`base ${servo[0].toFixed(0)}°  arm ${servo[1].toFixed(0)}°`, 10, 18);
 }
-let knob = [0, 0];
-function drawStick() {
-  const g = stickC.getContext('2d'), R = stickRadius(), cx = stickR.width / 2, cy = stickR.height / 2;
-  g.clearRect(0, 0, stickR.width, stickR.height);
-  g.strokeStyle = '#2a313c'; g.lineWidth = 2;
-  g.beginPath(); g.arc(cx, cy, R, 0, 2 * Math.PI); g.stroke();
-  g.beginPath(); g.arc(cx, cy, R * 0.06, 0, 2 * Math.PI); g.stroke();
-  g.fillStyle = '#4fb3ff';
-  g.beginPath(); g.arc(cx + knob[0] * R, cy - knob[1] * R, R * 0.28, 0, 2 * Math.PI); g.fill();
-}
-const stickRadius = () => Math.min(stickR.width, stickR.height) / 2 * 0.72;
-function layout() { armR = fit(armC); stickR = fit(stickC); drawArm(); drawStick(); }
+function layout() { armR = fit(armC); drawArm(); }
 addEventListener('resize', layout);
 
-// One finger per control, so left thumb on the arm box and right thumb on the stick work together
+// One pointer per control (left click only)
 function track(el, move, up) {
   let id = null;
-  el.addEventListener('pointerdown', e => { if (id !== null) return; id = e.pointerId; el.setPointerCapture(id); move(e); });
+  el.addEventListener('pointerdown', e => { if (id !== null || e.button !== 0) return; id = e.pointerId; el.setPointerCapture(id); move(e); });
   el.addEventListener('pointermove', e => { if (e.pointerId === id) move(e); });
   const end = e => { if (e.pointerId === id) { id = null; up && up(e); } };
   el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
 }
+// Grab a part: rod 1 = base servo only, rod 2 = arm servo only, tip or empty space = IK
+const segDist = (p, a, b) => {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)));
+  return Math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy);
+};
+const wrap = (d, lo) => ((d - lo) % 360 + 360) % 360 + lo;  // angle into [lo, lo+360)
+const GRAB = 2.5;  // cm
+let grab = 'ik';
 track(armC, e => {
   const m = armMap(), r = armC.getBoundingClientRect();
   tap = [(e.clientX - r.left - m.ox) / m.s, (m.oy - (e.clientY - r.top)) / m.s];
-  const sol = ik(tap[0], tap[1], servo);
-  if (sol) servo = sol;
+  const [el, tip] = fk(servo), clamp = (v, [lo, hi]) => Math.max(lo, Math.min(hi, v));
+  if (e.type === 'pointerdown') {
+    const d1 = segDist(tap, [0, 0], el), d2 = segDist(tap, el, tip);
+    grab = Math.hypot(tap[0] - tip[0], tap[1] - tip[1]) < GRAB ? 'ik' : d1 < GRAB && d1 <= d2 ? 'base' : d2 < GRAB ? 'arm' : 'ik';
+  }
+  const deg = (p, o) => Math.atan2(p[1] - o[1], p[0] - o[0]) * 180 / Math.PI;
+  if (grab === 'base') servo = [clamp(wrap(deg(tap, [0, 0]), -90), LIMITS.base), servo[1]];
+  else if (grab === 'arm') servo = [servo[0], clamp(wrap(deg(tap, el) - servo[0] + 180, -45), LIMITS.arm)];
+  else { const sol = ik(tap[0], tap[1], servo); if (sol) servo = sol; }
   drawArm();
-});
-track(stickC, e => {
-  const r = stickC.getBoundingClientRect(), R = stickRadius();
-  let x = (e.clientX - r.left - r.width / 2) / R, y = -(e.clientY - r.top - r.height / 2) / R;
-  const d = Math.hypot(x, y);
-  if (d > 1) { x /= d; y /= d; }
-  knob = [x, y];
-  // Speed grows with distance from the centre: arcade mix, small deadzone at the nipple
-  const dz = v => Math.abs(v) < 0.06 ? 0 : v;
-  const c = v => Math.round(Math.max(-1, Math.min(1, v)) * 255);
-  drive = [c(dz(y) + dz(x)), c(dz(y) - dz(x))];
-  drawStick();
-}, () => { knob = [0, 0]; drive = [0, 0]; drawStick(); });
-
-for (const [id, v] of [['open', 1], ['close', -1]]) {
-  const b = $(id);
-  b.addEventListener('pointerdown', e => { b.setPointerCapture(e.pointerId); claw = v; b.classList.add('held'); });
-  const off = () => { claw = 0; b.classList.remove('held'); };
-  b.addEventListener('pointerup', off); b.addEventListener('pointercancel', off);
+}, () => { grab = 'ik'; tap = null; drawArm(); });
+// ---- keyboard drive ----
+// W/S straight, A/D spin in place (skid steer), W+A / W+D / S+A / S+D swing: the inside track stops
+const held = new Set();
+let speed = 0.5;
+function keys() {
+  const k = c => held.has(c) ? 1 : 0;
+  const y = k('KeyW') - k('KeyS'), x = k('KeyD') - k('KeyA'), v = Math.round(speed * 255);
+  const [l, r] = !y ? [x, -x] : !x ? [y, y] : x > 0 ? [y, 0] : [0, y];
+  drive = [l * v, r * v];
+  claw = k('KeyQ') - k('KeyE');  // Q open, E close
+  for (const c of 'QWEASD') $('k' + c).classList.toggle('on', held.has('Key' + c));
+  $('spd').textContent = Math.round(speed * 100) + '%';
+  $('speed').firstChild.style.width = speed * 100 + '%';
 }
+addEventListener('keydown', e => { if (!authed || e.repeat || !/^Key[QWEASD]$/.test(e.code)) return; held.add(e.code); keys(); });
+addEventListener('keyup', e => { held.delete(e.code); keys(); });
+addEventListener('blur', () => { held.clear(); keys(); });  // tab switched away mid-drive: stop
+addEventListener('wheel', e => {
+  e.preventDefault();
+  speed = Math.max(0.1, Math.min(1, Math.round((speed - Math.sign(e.deltaY) * 0.05) * 100) / 100));
+  keys();
+}, { passive: false });
+keys();
+
 // Hold for 0.6s so a stray tap can't fling the arm
 const tb = $('throw'), fill = tb.querySelector('i');
 let holdT;
@@ -232,6 +248,7 @@ $('login').querySelector('form').addEventListener('submit', async e => {
     $('msg').textContent = 'Logging in...';
     document.documentElement.requestFullscreen?.().catch(() => {});
     login();
+    setTimeout(() => { if (!authed && $('msg').textContent === 'Logging in...') $('msg').textContent = 'No reply from rover. Check HC-05 TX/RX wiring and that the Uno is running.'; }, 3000);
   } catch (err) { $('msg').textContent = err.message; }
 });
 
